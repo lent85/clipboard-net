@@ -1,0 +1,21 @@
+services:
+  clipnet-hub:
+    build: .
+    container_name: clipnet-hub
+    restart: unless-stopped
+    ports:
+      - "48220:48220"
+    volumes:
+      # Named volume initializes with container uid/gid 10001 ownership.
+      # For a host bind mount (e.g. ./hub-certs:/certs), ensure uid 10001 can write to it.
+      - clipnet-hub-certs:/certs
+    environment:
+      CLIPNET_BIND: "0.0.0.0:48220"
+      CLIPNET_TLS: "true"
+      CLIPNET_CERT_DIR: "/certs"
+      CLIPNET_NAME: "ClipboardNet Docker Hub"
+      # Optional shared secret for /ws/hub clients:
+      # CLIPNET_SECRET: "change-this-secret"
+
+volumes:
+  clipnet-hub-certs:

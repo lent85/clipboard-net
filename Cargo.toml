@@ -1,0 +1,48 @@
+[workspace]
+members = ["crates/clipnet-core", "crates/clipnet-hub", "src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+webpki-roots = "0.26"
+rcgen = "0.13"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server-auto", "service"] }
+tower = "0.5"
+mdns-sd = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+local-ip-address = "0.6"
+hostname = "0.4"
+directories = "6"
+urlencoding = "2"
+walkdir = "2"
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+async-trait = "0.1"
+x11rb = { version = "0.13", features = ["xfixes"] }
+clipboard-rs = "0.3"
+rustls-pki-types = "1"

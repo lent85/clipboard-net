@@ -1,0 +1,22 @@
+# Exclude build artifacts, desktop app sources, and local certs from Docker context
+target/
+node_modules/
+dist/
+src-tauri/
+src/
+index.html
+package.json
+package-lock.json
+tsconfig.json
+vite.config.ts
+.git/
+.github/
+hub-certs/
+docker-compose.yml
+*.md
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+

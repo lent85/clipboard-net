@@ -1,0 +1,78 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in ClipboardNet
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please fill in the environment details below so we can reproduce and fix it quickly.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating System / Environment
+      description: Which platform or display server are you running on?
+      options:
+        - Ubuntu (Wayland / XWayland)
+        - Ubuntu / Debian (X11)
+        - Ubuntu / Debian (ARM64)
+        - Windows 11 / 10 (x86_64)
+        - Windows 11 (ARM64)
+        - macOS (Apple Silicon ARM64)
+        - macOS (Intel x86_64)
+        - Docker / clipnet-hub
+        - Other Linux
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: App / Hub Version
+      description: Version shown in Settings or `clipnet-hub --version`.
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connection_mode
+    attributes:
+      label: Connection Mode
+      options:
+        - LAN Auto-Discovery (mDNS / UDP)
+        - Direct Peer
+        - Embedded Hub
+        - External Hub (clipnet-hub)
+        - WAN Relay Room
+        - SSH Tunnel
+        - Local Clipboard / UI Only
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the issue clearly, along with what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Open ClipboardNet on ...
+        2. Copy ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics / Logs (Optional)
+      description: Paste relevant logs or anonymized Diagnostics JSON from Settings. Remember to remove any room secrets or private IPs before submitting.
+      render: json
+

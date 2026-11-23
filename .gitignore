@@ -1,0 +1,33 @@
+# Build artifacts
+target/
+dist/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/WixTools/
+coverage/
+*.profraw
+
+# Dependencies
+node_modules/
+
+# Local certs & secrets
+hub-certs/
+*.pem
+*.key
+*.crt
+
+# Logs & env
+*.log
+.env
+.env.*
+
+# Editors & IDEs
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
