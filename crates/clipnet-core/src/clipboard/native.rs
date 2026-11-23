@@ -197,7 +197,7 @@ pub fn spawn_native_clipboard(
                                 shutdown_rx.recv_timeout(Duration::from_millis(500)).ok();
                         }
                         if let Some(s) = shutdown_handle {
-                            s.signal();
+                            s.stop();
                         }
                         break;
                     }
