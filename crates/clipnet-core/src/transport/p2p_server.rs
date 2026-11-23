@@ -1,7 +1,7 @@
 use crate::config::TrustedPeer;
 use crate::crypto::{
     compute_auth_proof, decrypt_bytes, derive_key, derive_pairing_key, encrypt_bytes,
-    generate_nonce_hex, generate_pin, DeviceIdentity, EncryptedEnvelope,
+    generate_nonce_hex, generate_pin, generate_secret_hex, DeviceIdentity, EncryptedEnvelope,
 };
 use crate::protocol::{PeerInfo, SyncPayload, WireFrame, PROTOCOL_VERSION};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -21,6 +21,25 @@ use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+pub const PAIR_TIMEOUT_SECS: u64 = 180;
+pub const MAX_PIN_ATTEMPTS: u8 = 5;
+pub const DIRECT_PAIR_KEY_TOKEN: &str = "CLIPNET_DIRECT_ACCEPT_V1";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IncomingPairStatus {
+    Pending,
+    PinIssued,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairResponseAction {
+    AcceptDirect,
+    RequirePin,
+    Reject,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingPairUi {
     pub request_id: Uuid,
@@ -30,14 +49,19 @@ pub struct IncomingPairUi {
     pub fingerprint: String,
     pub remote_addr: String,
     pub pin: String,
+    pub status: IncomingPairStatus,
     pub created_at_ms: i64,
+    pub expires_at_ms: i64,
 }
 
 pub struct PendingIncomingPair {
     pub ui: IncomingPairUi,
     pub nonce_a: String,
     pub nonce_b: String,
-    pub decision: Option<bool>,
+    pub action: Option<PairResponseAction>,
+    pub pin_mode_notified: bool,
+    pub pin_attempts: u8,
+    pub deadline: tokio::time::Instant,
     pub confirm_envelope: Option<EncryptedEnvelope>,
     pub notify: Arc<Notify>,
 }
@@ -300,7 +324,7 @@ async fn handle_pair_flow(
         os: id_now.os.clone(),
         fingerprint: id_now.fingerprint(),
         nonce_hex: nonce_b.clone(),
-        requires_pin: true,
+        requires_pin: false,
     };
     if let Ok(txt) = serde_json::to_string(&challenge) {
         if sender.send(Message::Text(txt.into())).await.is_err() {
@@ -308,6 +332,8 @@ async fn handle_pair_flow(
         }
     }
 
+    let now_ms = Utc::now().timestamp_millis();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(PAIR_TIMEOUT_SECS);
     let ui = IncomingPairUi {
         request_id,
         device_id: peer_info.device_id,
@@ -316,7 +342,9 @@ async fn handle_pair_flow(
         fingerprint: peer_info.fingerprint.clone(),
         remote_addr: addr.ip().to_string(),
         pin: pin.clone(),
-        created_at_ms: Utc::now().timestamp_millis(),
+        status: IncomingPairStatus::Pending,
+        created_at_ms: now_ms,
+        expires_at_ms: now_ms + (PAIR_TIMEOUT_SECS as i64 * 1000),
     };
     let notify = Arc::new(Notify::new());
 
@@ -328,7 +356,10 @@ async fn handle_pair_flow(
                 ui,
                 nonce_a: nonce_a.clone(),
                 nonce_b: nonce_b.clone(),
-                decision: None,
+                action: None,
+                pin_mode_notified: false,
+                pin_attempts: 0,
+                deadline,
                 confirm_envelope: None,
                 notify: notify.clone(),
             },
@@ -339,93 +370,178 @@ async fn handle_pair_flow(
     let _ = state.evt_tx.send(P2pServerEvent::Log {
         level: "info".to_string(),
         message: format!(
-            "Incoming pairing request from {} ({}) [PIN: {pin}]",
+            "Incoming pairing request from {} ({})",
             peer_info.device_name,
             addr.ip()
         ),
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        // Evaluate if both user approval and confirm envelope are present
         let eval = {
-            let pending = state.pending_pairs.lock().await;
-            pending
-                .get(&request_id)
-                .map(|p| (p.decision, p.confirm_envelope.clone()))
-        };
-        let Some((decision, confirm_opt)) = eval else {
-            break;
-        };
-
-        if let Some(false) = decision {
-            let res = WireFrame::PairResult {
-                accepted: false,
-                reason: Some("Pairing declined on remote device".to_string()),
-                peer_secret_encrypted: None,
-            };
-            if let Ok(txt) = serde_json::to_string(&res) {
-                let _ = sender.send(Message::Text(txt.into())).await;
-            }
-            break;
-        }
-
-        if let (Some(true), Some(confirm_env)) = (decision, confirm_opt) {
-            let Ok(pair_key) = derive_pairing_key(&pin, &nonce_a, &nonce_b) else {
-                break;
-            };
-            match decrypt_bytes(&pair_key, b"clipnet-pair-confirm-v1", &confirm_env) {
-                Ok(secret_bytes) => {
-                    if let Ok(shared_secret) = String::from_utf8(secret_bytes) {
-                        let ack_env = encrypt_bytes(
-                            &pair_key,
-                            b"clipnet-pair-ack-v1",
-                            shared_secret.as_bytes(),
-                        )
-                        .ok();
-                        let res = WireFrame::PairResult {
-                            accepted: true,
-                            reason: None,
-                            peer_secret_encrypted: ack_env,
-                        };
-                        if let Ok(txt) = serde_json::to_string(&res) {
-                            let _ = sender.send(Message::Text(txt.into())).await;
-                        }
-                        let trusted = TrustedPeer {
-                            device_id: peer_info.device_id,
-                            device_name: peer_info.device_name.clone(),
-                            os: peer_info.os.clone(),
-                            fingerprint: peer_info.fingerprint.clone(),
-                            shared_secret,
-                            last_addr: Some(addr.ip().to_string()),
-                            muted: false,
-                            direction_override: None,
-                            paired_at_ms: Utc::now().timestamp_millis(),
-                        };
-                        let _ = state.evt_tx.send(P2pServerEvent::PeerPaired(trusted));
-                        break;
-                    }
+            let mut pending = state.pending_pairs.lock().await;
+            pending.get_mut(&request_id).map(|p| {
+                let act = p.action;
+                let notify_pin =
+                    act == Some(PairResponseAction::RequirePin) && !p.pin_mode_notified;
+                if notify_pin {
+                    p.pin_mode_notified = true;
                 }
-                Err(_) => {
-                    let res = WireFrame::PairResult {
-                        accepted: false,
-                        reason: Some("Invalid 6-digit PIN".to_string()),
-                        peer_secret_encrypted: None,
-                    };
-                    if let Ok(txt) = serde_json::to_string(&res) {
-                        let _ = sender.send(Message::Text(txt.into())).await;
-                    }
+                let env = if act == Some(PairResponseAction::RequirePin) {
+                    p.confirm_envelope.take()
+                } else {
+                    None
+                };
+                (act, notify_pin, env, p.pin_attempts, p.deadline)
+            })
+        };
+        let Some((action, should_notify_pin, confirm_opt, attempts, current_deadline)) = eval
+        else {
+            break;
+        };
+
+        if should_notify_pin {
+            let mode_frame = WireFrame::PairModeSelected { requires_pin: true };
+            if let Ok(txt) = serde_json::to_string(&mode_frame) {
+                if sender.send(Message::Text(txt.into())).await.is_err() {
                     break;
                 }
             }
         }
 
+        match action {
+            Some(PairResponseAction::Reject) => {
+                let res = WireFrame::PairResult {
+                    accepted: false,
+                    reason: Some("Pairing declined on remote device".to_string()),
+                    peer_secret_encrypted: None,
+                    direct_accept: false,
+                    retryable: false,
+                };
+                if let Ok(txt) = serde_json::to_string(&res) {
+                    let _ = sender.send(Message::Text(txt.into())).await;
+                }
+                break;
+            }
+            Some(PairResponseAction::AcceptDirect) => {
+                let Ok(direct_key) = derive_pairing_key(DIRECT_PAIR_KEY_TOKEN, &nonce_a, &nonce_b)
+                else {
+                    break;
+                };
+                let shared_secret = generate_secret_hex();
+                let Ok(env) = encrypt_bytes(
+                    &direct_key,
+                    b"clipnet-pair-direct-v1",
+                    shared_secret.as_bytes(),
+                ) else {
+                    break;
+                };
+                let res = WireFrame::PairResult {
+                    accepted: true,
+                    reason: None,
+                    peer_secret_encrypted: Some(env),
+                    direct_accept: true,
+                    retryable: false,
+                };
+                if let Ok(txt) = serde_json::to_string(&res) {
+                    let _ = sender.send(Message::Text(txt.into())).await;
+                }
+                let trusted = TrustedPeer {
+                    device_id: peer_info.device_id,
+                    device_name: peer_info.device_name.clone(),
+                    os: peer_info.os.clone(),
+                    fingerprint: peer_info.fingerprint.clone(),
+                    shared_secret,
+                    last_addr: Some(addr.ip().to_string()),
+                    muted: false,
+                    direction_override: None,
+                    paired_at_ms: Utc::now().timestamp_millis(),
+                };
+                let _ = state.evt_tx.send(P2pServerEvent::PeerPaired(trusted));
+                break;
+            }
+            Some(PairResponseAction::RequirePin) => {
+                if let Some(confirm_env) = confirm_opt {
+                    let Ok(pair_key) = derive_pairing_key(&pin, &nonce_a, &nonce_b) else {
+                        break;
+                    };
+                    match decrypt_bytes(&pair_key, b"clipnet-pair-confirm-v1", &confirm_env) {
+                        Ok(secret_bytes) => {
+                            if let Ok(shared_secret) = String::from_utf8(secret_bytes) {
+                                let ack_env = encrypt_bytes(
+                                    &pair_key,
+                                    b"clipnet-pair-ack-v1",
+                                    shared_secret.as_bytes(),
+                                )
+                                .ok();
+                                let res = WireFrame::PairResult {
+                                    accepted: true,
+                                    reason: None,
+                                    peer_secret_encrypted: ack_env,
+                                    direct_accept: false,
+                                    retryable: false,
+                                };
+                                if let Ok(txt) = serde_json::to_string(&res) {
+                                    let _ = sender.send(Message::Text(txt.into())).await;
+                                }
+                                let trusted = TrustedPeer {
+                                    device_id: peer_info.device_id,
+                                    device_name: peer_info.device_name.clone(),
+                                    os: peer_info.os.clone(),
+                                    fingerprint: peer_info.fingerprint.clone(),
+                                    shared_secret,
+                                    last_addr: Some(addr.ip().to_string()),
+                                    muted: false,
+                                    direction_override: None,
+                                    paired_at_ms: Utc::now().timestamp_millis(),
+                                };
+                                let _ = state.evt_tx.send(P2pServerEvent::PeerPaired(trusted));
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            let next_attempts = attempts + 1;
+                            {
+                                let mut pending = state.pending_pairs.lock().await;
+                                if let Some(entry) = pending.get_mut(&request_id) {
+                                    entry.pin_attempts = next_attempts;
+                                }
+                            }
+                            let retryable = next_attempts < MAX_PIN_ATTEMPTS;
+                            let msg = if retryable {
+                                format!(
+                                    "Invalid 6-digit PIN ({next_attempts}/{MAX_PIN_ATTEMPTS} attempts)"
+                                )
+                            } else {
+                                "Too many invalid PIN attempts".to_string()
+                            };
+                            let res = WireFrame::PairResult {
+                                accepted: false,
+                                reason: Some(msg),
+                                peer_secret_encrypted: None,
+                                direct_accept: false,
+                                retryable,
+                            };
+                            if let Ok(txt) = serde_json::to_string(&res) {
+                                let _ = sender.send(Message::Text(txt.into())).await;
+                            }
+                            if !retryable {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(current_deadline) => {
                 let res = WireFrame::PairResult {
                     accepted: false,
                     reason: Some("Pairing request timed out".to_string()),
                     peer_secret_encrypted: None,
+                    direct_accept: false,
+                    retryable: false,
                 };
                 if let Ok(txt) = serde_json::to_string(&res) {
                     let _ = sender.send(Message::Text(txt.into())).await;

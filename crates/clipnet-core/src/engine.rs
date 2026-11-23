@@ -13,7 +13,7 @@ use crate::discovery::{
 use crate::history::{HistoryEntry, HistoryOrigin, HistoryStore};
 use crate::protocol::{ClipboardData, PeerInfo, SyncPayload};
 use crate::transfer::{read_file_chunks_and_send, TransferInfo, TransferManager, TransferState};
-use crate::transport::p2p_server::IncomingPairUi;
+use crate::transport::p2p_server::{IncomingPairUi, PairResponseAction};
 use crate::transport::{
     ActivePeerSnapshot, ConnectionTestResult, EmbeddedHubProvider, EmbeddedHubStatus,
     OutboundPairInfo, ProfileRuntimeStatus, TransportEvent, TransportManager,
@@ -24,6 +24,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -106,6 +107,7 @@ pub enum EngineEvent {
     HistoryUpdated(Vec<HistoryEntry>),
     TransfersUpdated(Vec<TransferInfo>),
     IncomingPairsUpdated(Vec<IncomingPairUi>),
+    OutboundPairUpdated(OutboundPairInfo),
     Toast {
         level: String,
         title: String,
@@ -130,6 +132,8 @@ pub struct SyncEngine {
     recent_logs: Arc<Mutex<VecDeque<LogEntry>>>,
     syncing_until: Arc<Mutex<Option<Instant>>>,
     active_file_send_streams: Arc<Mutex<HashSet<(Uuid, Uuid)>>>,
+    skip_password_managers: Arc<AtomicBool>,
+    notified_pair_ids: Mutex<HashSet<Uuid>>,
 }
 
 impl SyncEngine {
@@ -155,8 +159,9 @@ impl SyncEngine {
             hub_provider,
         );
 
+        let skip_password_managers = Arc::new(AtomicBool::new(cfg.privacy.skip_password_managers));
         let (clipboard_handle, clipboard_rx_opt) = if enable_os_clipboard {
-            let (h, rx) = start_clipboard_backend();
+            let (h, rx) = start_clipboard_backend(skip_password_managers.clone());
             (Some(h), Some(rx))
         } else {
             (None, None)
@@ -192,6 +197,8 @@ impl SyncEngine {
             recent_logs: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
             syncing_until: Arc::new(Mutex::new(None)),
             active_file_send_streams: Arc::new(Mutex::new(HashSet::new())),
+            skip_password_managers,
+            notified_pair_ids: Mutex::new(HashSet::new()),
         });
 
         engine
@@ -272,7 +279,7 @@ impl SyncEngine {
                 let _ = self.events_tx.send(EngineEvent::Toast {
                     level: "info".to_string(),
                     title: "Privacy Guard".to_string(),
-                    message: "Sensitive password/secret skipped".to_string(),
+                    message: format!("Skipped sensitive text item ({reason})"),
                     from_remote: false,
                 });
                 self.emit_snapshot().await;
@@ -434,18 +441,30 @@ impl SyncEngine {
                 let _ = self
                     .events_tx
                     .send(EngineEvent::IncomingPairsUpdated(list.clone()));
-                if let Some(first) = list.first() {
+                let newly_added: Vec<_> = {
+                    let mut seen = self.notified_pair_ids.lock().await;
+                    let active_ids: HashSet<Uuid> = list.iter().map(|r| r.request_id).collect();
+                    seen.retain(|id| active_ids.contains(id));
+                    list.iter()
+                        .filter(|r| seen.insert(r.request_id))
+                        .cloned()
+                        .collect()
+                };
+                for req in newly_added {
                     let _ = self.events_tx.send(EngineEvent::Toast {
                         level: "info".to_string(),
                         title: "Pairing Request".to_string(),
                         message: format!(
-                            "{} wants to pair (PIN: {})",
-                            first.device_name, first.pin
+                            "{} ({}) wants to pair — open Pair Requests to Accept or issue a PIN",
+                            req.device_name, req.remote_addr
                         ),
                         from_remote: true,
                     });
                 }
                 self.emit_snapshot().await;
+            }
+            TransportEvent::OutboundPairUpdated(info) => {
+                let _ = self.events_tx.send(EngineEvent::OutboundPairUpdated(info));
             }
             TransportEvent::PeerPaired(peer) => {
                 self.upsert_trusted_peer(peer.clone()).await;
@@ -956,6 +975,8 @@ impl SyncEngine {
     pub async fn update_config(&self, new_cfg: AppConfig) -> Result<(), String> {
         let dl_dir = PathBuf::from(&new_cfg.ui.download_dir);
         self.transfers.set_download_dir(dl_dir).await;
+        self.skip_password_managers
+            .store(new_cfg.privacy.skip_password_managers, Ordering::Relaxed);
         new_cfg
             .save(&self.paths.config_file)
             .map_err(|e| e.to_string())?;
@@ -1219,11 +1240,15 @@ impl SyncEngine {
     pub async fn respond_incoming_pair(
         &self,
         request_id: Uuid,
-        accept: bool,
+        action: PairResponseAction,
     ) -> Result<(), String> {
         self.transport
-            .respond_incoming_pair(request_id, accept)
+            .respond_incoming_pair(request_id, action)
             .await
+    }
+
+    pub async fn cancel_pairing(&self, session_id: Uuid) -> Result<(), String> {
+        self.transport.cancel_pairing(session_id).await
     }
 
     pub async fn list_incoming_pairs(&self) -> Vec<IncomingPairUi> {

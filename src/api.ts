@@ -10,6 +10,7 @@ import type {
   LanDiscoveryConfig,
   LocalInterfaceInfo,
   OutboundPairInfo,
+  PairResponseAction,
   SyncDirection,
   TelemetrySnapshot,
   TransferInfo,
@@ -41,8 +42,10 @@ export const api = {
   startPairing: (addr: string) => invoke<OutboundPairInfo>("start_pairing", { addr }),
   submitPairPin: (sessionId: string, pin: string) =>
     invoke<TrustedPeerSummary>("submit_pair_pin", { sessionId, pin }),
-  respondIncomingPair: (requestId: string, accept: boolean) =>
-    invoke<void>("respond_incoming_pair", { requestId, accept }),
+  respondIncomingPair: (requestId: string, action: PairResponseAction) =>
+    invoke<void>("respond_incoming_pair", { requestId, action }),
+  cancelPairing: (sessionId: string) =>
+    invoke<void>("cancel_pairing", { sessionId }),
   updatePeerSettings: (
     deviceId: string,
     muted: boolean,

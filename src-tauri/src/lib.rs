@@ -127,6 +127,9 @@ pub fn run() {
                         Ok(EngineEvent::IncomingPairsUpdated(pairs)) => {
                             let _ = ah.emit("clipnet://pairing", &pairs);
                         }
+                        Ok(EngineEvent::OutboundPairUpdated(info)) => {
+                            let _ = ah.emit("clipnet://outbound-pair", &info);
+                        }
                         Ok(EngineEvent::Toast {
                             level,
                             title,
@@ -204,6 +207,7 @@ pub fn run() {
             commands::start_pairing,
             commands::submit_pair_pin,
             commands::respond_incoming_pair,
+            commands::cancel_pairing,
             commands::update_peer_settings,
             commands::revoke_peer,
             commands::ping_peers,

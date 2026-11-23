@@ -268,6 +268,16 @@ export interface TransferInfo {
   updated_at_ms: number;
 }
 
+export type IncomingPairStatus = "pending" | "pin_issued";
+export type PairResponseAction = "accept_direct" | "require_pin" | "reject";
+export type OutboundPairState =
+  | "waiting_approval"
+  | "pin_required"
+  | "verifying"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
 export interface IncomingPairUi {
   request_id: string;
   device_id: string;
@@ -276,7 +286,9 @@ export interface IncomingPairUi {
   fingerprint: string;
   remote_addr: string;
   pin: string;
+  status: IncomingPairStatus;
   created_at_ms: number;
+  expires_at_ms: number;
 }
 
 export interface OutboundPairInfo {
@@ -286,6 +298,9 @@ export interface OutboundPairInfo {
   target_os: string;
   target_fingerprint: string;
   requires_pin: boolean;
+  state: OutboundPairState;
+  message: string | null;
+  expires_at_ms: number;
 }
 
 export interface ConnectionTestResult {
@@ -307,4 +322,6 @@ export interface ToastNotification {
   title: string;
   message: string;
   from_remote?: boolean;
+  actionLabel?: string;
+  onAction?: () => void;
 }

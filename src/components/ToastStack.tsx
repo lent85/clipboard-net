@@ -38,6 +38,18 @@ export function ToastStack({ toasts, onDismiss }: Props) {
               <div className="mt-0.5 line-clamp-2 text-[11px] text-slate-600 dark:text-slate-300">
                 {t.message}
               </div>
+              {t.actionLabel && t.onAction && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    t.onAction?.();
+                    onDismiss(t.id);
+                  }}
+                  className="mt-1.5 rounded-md bg-cyan-500/15 px-2 py-0.5 text-[11px] font-semibold text-cyan-700 hover:bg-cyan-500/25 dark:text-cyan-300"
+                >
+                  {t.actionLabel}
+                </button>
+              )}
             </div>
             <button
               type="button"

@@ -4,17 +4,30 @@ import {
   ArrowDownLeft,
   ArrowLeftRight,
   ArrowUpRight,
+  KeyRound,
   Lock,
   MonitorCheck,
   Pause,
   ShieldAlert,
   Wifi,
 } from "lucide-react";
-import type { OverallStatus, SyncDirection, TelemetrySnapshot } from "../types";
+import type {
+  IncomingPairUi,
+  OverallStatus,
+  PairResponseAction,
+  SyncDirection,
+  TelemetrySnapshot,
+} from "../types";
 import { formatRelativeTime } from "../api";
+import { PendingPairsDropdown } from "./PendingPairsPanel";
 
 interface Props {
   snapshot: TelemetrySnapshot;
+  incomingPairs: IncomingPairUi[];
+  pairsMenuOpen: boolean;
+  onTogglePairsMenu: (open: boolean) => void;
+  onRespondIncomingPair: (requestId: string, action: PairResponseAction) => Promise<void>;
+  onGoToDevices: () => void;
   onChangeDirection: (dir: SyncDirection) => void;
   onOpenSettingsDiagnostics: () => void;
 }
@@ -63,6 +76,11 @@ const STATUS_META: Record<
 
 export function TopTelemetryBar({
   snapshot,
+  incomingPairs,
+  pairsMenuOpen,
+  onTogglePairsMenu,
+  onRespondIncomingPair,
+  onGoToDevices,
   onChangeDirection,
   onOpenSettingsDiagnostics,
 }: Props) {
@@ -117,8 +135,41 @@ export function TopTelemetryBar({
         </div>
       </div>
 
-      {/* Center-Right: E2EE Badge + Clipboard Engine Health Pill */}
+      {/* Center-Right: Pair Requests Menu + E2EE Badge + Clipboard Engine Health Pill */}
       <div className="flex items-center gap-2">
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => onTogglePairsMenu(!pairsMenuOpen)}
+            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition ${
+              incomingPairs.length > 0
+                ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-700 hover:bg-cyan-500/25 dark:text-cyan-200"
+                : "border-slate-200 bg-slate-100/80 text-slate-600 hover:bg-slate-200/70 dark:border-slate-800 dark:bg-slate-800/70 dark:text-slate-300 dark:hover:bg-slate-800"
+            }`}
+          >
+            <KeyRound
+              className={`h-3.5 w-3.5 ${
+                incomingPairs.length > 0 ? "text-cyan-500" : "text-slate-400"
+              }`}
+            />
+            <span>Pair Requests</span>
+            {incomingPairs.length > 0 && (
+              <span className="animate-pulse rounded-full bg-cyan-500 px-1.5 py-0.2 text-[10px] font-black text-slate-950">
+                {incomingPairs.length}
+              </span>
+            )}
+          </button>
+
+          {pairsMenuOpen && (
+            <PendingPairsDropdown
+              pairs={incomingPairs}
+              onRespond={onRespondIncomingPair}
+              onGoToDevices={onGoToDevices}
+              onClose={() => onTogglePairsMenu(false)}
+            />
+          )}
+        </div>
+
         <div
           title={`End-to-End Encrypted (AES-256-GCM)\nDevice Fingerprint: ${snapshot.fingerprint}`}
           className="hidden items-center gap-1.5 rounded-full border border-slate-200 bg-slate-100/70 px-2.5 py-1 text-[11px] font-medium text-slate-600 sm:inline-flex dark:border-slate-800 dark:bg-slate-800/60 dark:text-slate-300"

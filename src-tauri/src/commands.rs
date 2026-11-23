@@ -6,7 +6,7 @@ use clipnet_core::discovery::LocalInterfaceInfo;
 use clipnet_core::engine::{SyncEngine, TelemetrySnapshot, TrustedPeerSummary};
 use clipnet_core::history::HistoryEntry;
 use clipnet_core::transfer::TransferInfo;
-use clipnet_core::transport::p2p_server::IncomingPairUi;
+use clipnet_core::transport::p2p_server::{IncomingPairUi, PairResponseAction};
 use clipnet_core::transport::{ConnectionTestResult, OutboundPairInfo};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -164,9 +164,14 @@ pub async fn submit_pair_pin(
 pub async fn respond_incoming_pair(
     state: State<'_, AppState>,
     request_id: Uuid,
-    accept: bool,
+    action: PairResponseAction,
 ) -> Result<(), String> {
-    state.engine.respond_incoming_pair(request_id, accept).await
+    state.engine.respond_incoming_pair(request_id, action).await
+}
+
+#[tauri::command]
+pub async fn cancel_pairing(state: State<'_, AppState>, session_id: Uuid) -> Result<(), String> {
+    state.engine.cancel_pairing(session_id).await
 }
 
 #[tauri::command]

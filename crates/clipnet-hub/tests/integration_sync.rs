@@ -3,6 +3,8 @@ use clipnet_core::config::{AppConfig, AppPaths, ConnectionProfile, ConnectionPro
 use clipnet_core::engine::{EngineEvent, SyncEngine};
 use clipnet_core::history::HistoryItemKind;
 use clipnet_core::transfer::TransferState;
+use clipnet_core::transport::p2p_server::{IncomingPairStatus, PairResponseAction};
+use clipnet_core::transport::OutboundPairState;
 use clipnet_hub::{HubConfig, HubServer};
 use image::{ImageBuffer, ImageFormat, Rgba};
 use std::fs;
@@ -376,12 +378,13 @@ async fn lan_p2p_pin_pairing_and_direct_sync() {
     let eng_a2 = SyncEngine::start(paths_a2, None, false).await.unwrap();
     let eng_b2 = SyncEngine::start(paths_b2, None, false).await.unwrap();
 
-    // Alice starts pairing to Bob
+    // Alice starts pairing to Bob (starts in WaitingApproval until Bob picks Direct or PIN)
     let out_pair = eng_a2
         .start_pairing(&format!("127.0.0.1:{port_b}"))
         .await
         .unwrap();
-    assert!(out_pair.requires_pin);
+    assert!(!out_pair.requires_pin);
+    assert_eq!(out_pair.state, OutboundPairState::WaitingApproval);
 
     // Wait for Bob to register incoming pair request
     let incoming = tokio::time::timeout(Duration::from_secs(5), async {
@@ -395,11 +398,44 @@ async fn lan_p2p_pin_pairing_and_direct_sync() {
     })
     .await
     .expect("Bob did not receive pairing request");
+    assert_eq!(incoming.status, IncomingPairStatus::Pending);
 
+    // Bob selects RequirePin -> status becomes PinIssued and Alice receives PairModeSelected
+    let mut rx_a_events = eng_a2.subscribe();
     eng_b2
-        .respond_incoming_pair(incoming.request_id, true)
+        .respond_incoming_pair(incoming.request_id, PairResponseAction::RequirePin)
         .await
         .unwrap();
+
+    let updated_b = eng_b2.list_incoming_pairs().await;
+    assert_eq!(updated_b[0].status, IncomingPairStatus::PinIssued);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(EngineEvent::OutboundPairUpdated(info)) = rx_a_events.recv().await {
+                if info.session_id == out_pair.session_id
+                    && info.state == OutboundPairState::PinRequired
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("Alice did not receive PairModeSelected(PinRequired)");
+
+    // Wrong PIN must fail without tearing down the session
+    let wrong_pin = if incoming.pin == "000000" {
+        "999999"
+    } else {
+        "000000"
+    };
+    assert!(eng_a2
+        .submit_pair_pin(out_pair.session_id, wrong_pin)
+        .await
+        .is_err());
+
+    // Retrying with the valid PIN must succeed
     let trusted = eng_a2
         .submit_pair_pin(out_pair.session_id, &incoming.pin)
         .await
@@ -471,4 +507,144 @@ async fn lan_p2p_pin_pairing_and_direct_sync() {
     eng_b2.shutdown().await;
     let _ = fs::remove_dir_all(&base_a2);
     let _ = fs::remove_dir_all(&base_b2);
+}
+
+#[tokio::test]
+async fn lan_p2p_direct_accept_pairing_without_pin() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pick_port = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let port_a = pick_port();
+    let port_b = pick_port();
+    let udp_port = pick_port();
+
+    let (base_a, paths_a) = make_temp_paths("direct-pair-a");
+    let (base_b, paths_b) = make_temp_paths("direct-pair-b");
+
+    let mut cfg_a = AppConfig::load_or_create(&paths_a.config_file).unwrap();
+    cfg_a.identity.device_name = "AliceDirect".to_string();
+    cfg_a.lan.enabled = true;
+    cfg_a.lan.listen_port = port_a;
+    cfg_a.lan.udp_beacon_port = udp_port;
+    cfg_a.save(&paths_a.config_file).unwrap();
+
+    let mut cfg_b = AppConfig::load_or_create(&paths_b.config_file).unwrap();
+    cfg_b.identity.device_name = "BobDirect".to_string();
+    cfg_b.lan.enabled = true;
+    cfg_b.lan.listen_port = port_b;
+    cfg_b.lan.udp_beacon_port = udp_port;
+    cfg_b.save(&paths_b.config_file).unwrap();
+
+    let eng_a = SyncEngine::start(paths_a, None, false).await.unwrap();
+    let eng_b = SyncEngine::start(paths_b, None, false).await.unwrap();
+    let mut rx_a = eng_a.subscribe();
+
+    let out_pair = eng_a
+        .start_pairing(&format!("127.0.0.1:{port_b}"))
+        .await
+        .unwrap();
+    assert_eq!(out_pair.state, OutboundPairState::WaitingApproval);
+
+    let incoming = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let list = eng_b.list_incoming_pairs().await;
+            if let Some(first) = list.first() {
+                break first.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Bob did not receive pairing request");
+
+    // Bob accepts directly without issuing or entering any PIN
+    eng_b
+        .respond_incoming_pair(incoming.request_id, PairResponseAction::AcceptDirect)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(EngineEvent::OutboundPairUpdated(info)) = rx_a.recv().await {
+                if info.session_id == out_pair.session_id
+                    && info.state == OutboundPairState::Completed
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("Alice did not complete direct-accept pairing");
+
+    // Verify both peers persisted matching shared_secret
+    let (sec_a, sec_b) = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let ca = eng_a.get_config().await;
+            let cb = eng_b.get_config().await;
+            if let (Some(ta), Some(tb)) = (ca.trusted_peers.first(), cb.trusted_peers.first()) {
+                break (ta.shared_secret.clone(), tb.shared_secret.clone());
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("Trusted peers not persisted after direct accept");
+    assert_eq!(sec_a, sec_b);
+
+    eng_a
+        .save_profile(ConnectionProfile {
+            id: Uuid::new_v4(),
+            name: "Bob Direct".to_string(),
+            enabled: true,
+            kind: ConnectionProfileKind::DirectPeer {
+                host: "127.0.0.1".to_string(),
+                port: port_b,
+                use_tls: false,
+                cert_fingerprint: None,
+                shared_secret: sec_a,
+            },
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if eng_a.snapshot().await.connected_peers_count >= 1
+                && eng_b.snapshot().await.connected_peers_count >= 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    })
+    .await
+    .expect("Direct-accepted peers did not connect");
+
+    eng_a
+        .inject_local_clipboard(ClipboardPayload::Text("Direct accept sync ok!".to_string()))
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if eng_b
+                .get_history()
+                .await
+                .iter()
+                .any(|e| e.text_preview == "Direct accept sync ok!")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    })
+    .await
+    .expect("Bob did not receive clipboard after direct-accept pairing");
+
+    eng_a.shutdown().await;
+    eng_b.shutdown().await;
+    let _ = fs::remove_dir_all(&base_a);
+    let _ = fs::remove_dir_all(&base_b);
 }

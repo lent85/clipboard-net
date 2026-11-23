@@ -54,6 +54,9 @@ pub enum WireFrame {
         nonce_hex: String,
         requires_pin: bool,
     },
+    PairModeSelected {
+        requires_pin: bool,
+    },
     PairConfirm {
         encrypted_secret: EncryptedEnvelope,
     },
@@ -61,6 +64,10 @@ pub enum WireFrame {
         accepted: bool,
         reason: Option<String>,
         peer_secret_encrypted: Option<EncryptedEnvelope>,
+        #[serde(default)]
+        direct_accept: bool,
+        #[serde(default)]
+        retryable: bool,
     },
     Encrypted {
         sender_id: Uuid,

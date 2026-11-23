@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use p2p_server::{
-    emit_pending_pairs, start_p2p_server, IncomingPairUi, P2pServerEvent, P2pServerHandle,
+    emit_pending_pairs, start_p2p_server, IncomingPairStatus, IncomingPairUi, P2pServerEvent,
+    P2pServerHandle, PairResponseAction, DIRECT_PAIR_KEY_TOKEN, PAIR_TIMEOUT_SECS,
 };
 use serde::{Deserialize, Serialize};
 use ssh_tunnel::{start_ssh_tunnel, SshTunnelSpec};
@@ -24,11 +25,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use ws_client::{connect_websocket, recv_json_frame, send_json_frame, WsStream};
+use ws_client::{connect_websocket, recv_json_frame, send_json_frame};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddedHubStatus {
@@ -101,6 +102,17 @@ pub struct ProfileRuntimeStatus {
     pub detected_cert_fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundPairState {
+    WaitingApproval,
+    PinRequired,
+    Verifying,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundPairInfo {
     pub session_id: Uuid,
@@ -109,6 +121,9 @@ pub struct OutboundPairInfo {
     pub target_os: String,
     pub target_fingerprint: String,
     pub requires_pin: bool,
+    pub state: OutboundPairState,
+    pub message: Option<String>,
+    pub expires_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +143,7 @@ pub enum TransportEvent {
         raw_bytes: usize,
     },
     IncomingPairChanged(Vec<IncomingPairUi>),
+    OutboundPairUpdated(OutboundPairInfo),
     PeerPaired(TrustedPeer),
     TopologyChanged,
     Log {
@@ -136,12 +152,16 @@ pub enum TransportEvent {
     },
 }
 
+enum OutboundPairCmd {
+    SubmitPin {
+        pin: String,
+        reply: oneshot::Sender<Result<TrustedPeer, String>>,
+    },
+    Cancel,
+}
+
 struct OutboundPairSession {
-    ws: WsStream,
-    target_info: PeerInfo,
-    remote_addr: String,
-    nonce_a: String,
-    nonce_b: String,
+    cmd_tx: mpsc::UnboundedSender<OutboundPairCmd>,
 }
 
 struct OutboundChannelHandle {
@@ -192,7 +212,7 @@ pub struct TransportManager {
     embedded_hub_status: Arc<RwLock<EmbeddedHubStatus>>,
     channels: Arc<RwLock<HashMap<Uuid, OutboundChannelHandle>>>,
     auto_lan_peers: Arc<RwLock<HashMap<Uuid, OutboundChannelHandle>>>,
-    outbound_pairs: Mutex<HashMap<Uuid, OutboundPairSession>>,
+    outbound_pairs: Arc<Mutex<HashMap<Uuid, OutboundPairSession>>>,
     evt_tx: mpsc::UnboundedSender<TransportEvent>,
     p2p_evt_tx: mpsc::UnboundedSender<P2pServerEvent>,
     total_tx_bytes: Arc<AtomicU64>,
@@ -222,7 +242,7 @@ impl TransportManager {
             embedded_hub_status: Arc::new(RwLock::new(EmbeddedHubStatus::default())),
             channels: Arc::new(RwLock::new(HashMap::new())),
             auto_lan_peers: Arc::new(RwLock::new(HashMap::new())),
-            outbound_pairs: Mutex::new(HashMap::new()),
+            outbound_pairs: Arc::new(Mutex::new(HashMap::new())),
             evt_tx: evt_tx.clone(),
             p2p_evt_tx,
             total_tx_bytes: Arc::new(AtomicU64::new(0)),
@@ -990,25 +1010,232 @@ impl TransportManager {
             .map(|(_, h, _, _)| h)
             .unwrap_or_else(|_| trimmed.to_string());
 
-        self.outbound_pairs.lock().await.insert(
-            session_id,
-            OutboundPairSession {
-                ws,
-                target_info,
-                remote_addr: remote_host,
-                nonce_a,
-                nonce_b,
-            },
-        );
-
-        Ok(OutboundPairInfo {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut info = OutboundPairInfo {
             session_id,
             target_device_id: device_id,
             target_name: device_name,
             target_os: os,
             target_fingerprint: fingerprint,
             requires_pin,
-        })
+            state: if requires_pin {
+                OutboundPairState::PinRequired
+            } else {
+                OutboundPairState::WaitingApproval
+            },
+            message: None,
+            expires_at_ms: now_ms + (PAIR_TIMEOUT_SECS as i64 * 1000),
+        };
+        let ret_info = info.clone();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<OutboundPairCmd>();
+        self.outbound_pairs
+            .lock()
+            .await
+            .insert(session_id, OutboundPairSession { cmd_tx });
+
+        let evt_tx = self.evt_tx.clone();
+        let sessions = self.outbound_pairs.clone();
+        let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+
+        tokio::spawn(async move {
+            let mut pending_pin_secret: Option<String> = None;
+            let mut pending_reply: Option<oneshot::Sender<Result<TrustedPeer, String>>> = None;
+            let timeout_sleep = tokio::time::sleep(Duration::from_secs(PAIR_TIMEOUT_SECS + 15));
+            tokio::pin!(timeout_sleep);
+
+            loop {
+                tokio::select! {
+                    _ = &mut timeout_sleep => {
+                        let msg = "Pairing request timed out".to_string();
+                        info.state = OutboundPairState::Failed;
+                        info.message = Some(msg.clone());
+                        let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                        if let Some(reply) = pending_reply.take() {
+                            let _ = reply.send(Err(msg));
+                        }
+                        break;
+                    }
+                    cmd_opt = cmd_rx.recv() => {
+                        let Some(cmd) = cmd_opt else { break; };
+                        match cmd {
+                            OutboundPairCmd::Cancel => {
+                                let _ = ws.close(None).await;
+                                info.state = OutboundPairState::Cancelled;
+                                info.message = Some("Cancelled by user".to_string());
+                                let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                if let Some(reply) = pending_reply.take() {
+                                    let _ = reply.send(Err("Pairing cancelled".to_string()));
+                                }
+                                break;
+                            }
+                            OutboundPairCmd::SubmitPin { pin, reply } => {
+                                let pair_key = match derive_pairing_key(&pin, &nonce_a, &nonce_b) {
+                                    Ok(k) => k,
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e.to_string()));
+                                        continue;
+                                    }
+                                };
+                                let shared_secret = generate_secret_hex();
+                                let encrypted_secret = match encrypt_bytes(
+                                    &pair_key,
+                                    b"clipnet-pair-confirm-v1",
+                                    shared_secret.as_bytes(),
+                                ) {
+                                    Ok(env) => env,
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e.to_string()));
+                                        continue;
+                                    }
+                                };
+                                let confirm = WireFrame::PairConfirm { encrypted_secret };
+                                let txt = match serde_json::to_string(&confirm) {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e.to_string()));
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) = ws.send(Message::Text(txt.into())).await {
+                                    let msg = e.to_string();
+                                    info.state = OutboundPairState::Failed;
+                                    info.message = Some(msg.clone());
+                                    let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                    let _ = reply.send(Err(msg));
+                                    break;
+                                }
+                                pending_pin_secret = Some(shared_secret);
+                                if let Some(old) = pending_reply.replace(reply) {
+                                    let _ = old.send(Err("Superseded by newer PIN attempt".to_string()));
+                                }
+                                info.state = OutboundPairState::Verifying;
+                                info.message = None;
+                                let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                            }
+                        }
+                    }
+                    ws_opt = ws.next() => {
+                        match ws_opt {
+                            Some(Ok(Message::Text(txt))) => {
+                                let Ok(frame) = serde_json::from_str::<WireFrame>(&txt) else {
+                                    continue;
+                                };
+                                match frame {
+                                    WireFrame::PairModeSelected { requires_pin: true } => {
+                                        info.requires_pin = true;
+                                        info.state = OutboundPairState::PinRequired;
+                                        info.message = None;
+                                        info.expires_at_ms = Utc::now().timestamp_millis() + (PAIR_TIMEOUT_SECS as i64 * 1000);
+                                        timeout_sleep.as_mut().reset(
+                                            tokio::time::Instant::now() + Duration::from_secs(PAIR_TIMEOUT_SECS + 15)
+                                        );
+                                        let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                    }
+                                    WireFrame::PairResult {
+                                        accepted: true,
+                                        direct_accept,
+                                        peer_secret_encrypted,
+                                        ..
+                                    } => {
+                                        let secret_res = if direct_accept {
+                                            match (
+                                                derive_pairing_key(DIRECT_PAIR_KEY_TOKEN, &nonce_a, &nonce_b),
+                                                peer_secret_encrypted,
+                                            ) {
+                                                (Ok(k), Some(env)) => {
+                                                    decrypt_bytes(&k, b"clipnet-pair-direct-v1", &env)
+                                                        .map_err(|e| e.to_string())
+                                                        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| e.to_string()))
+                                                }
+                                                _ => Err("Missing encrypted direct pairing secret".to_string()),
+                                            }
+                                        } else {
+                                            pending_pin_secret
+                                                .take()
+                                                .ok_or_else(|| "Missing local pairing secret".to_string())
+                                        };
+
+                                        match secret_res {
+                                            Ok(shared_secret) => {
+                                                let trusted = TrustedPeer {
+                                                    device_id: target_info.device_id,
+                                                    device_name: target_info.device_name.clone(),
+                                                    os: target_info.os.clone(),
+                                                    fingerprint: target_info.fingerprint.clone(),
+                                                    shared_secret,
+                                                    last_addr: Some(remote_host.clone()),
+                                                    muted: false,
+                                                    direction_override: None,
+                                                    paired_at_ms: Utc::now().timestamp_millis(),
+                                                };
+                                                let _ = evt_tx.send(TransportEvent::PeerPaired(trusted.clone()));
+                                                info.state = OutboundPairState::Completed;
+                                                info.message = None;
+                                                let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                                if let Some(reply) = pending_reply.take() {
+                                                    let _ = reply.send(Ok(trusted));
+                                                }
+                                            }
+                                            Err(err_msg) => {
+                                                info.state = OutboundPairState::Failed;
+                                                info.message = Some(err_msg.clone());
+                                                let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                                if let Some(reply) = pending_reply.take() {
+                                                    let _ = reply.send(Err(err_msg));
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    WireFrame::PairResult {
+                                        accepted: false,
+                                        reason,
+                                        retryable,
+                                        ..
+                                    } => {
+                                        let err_msg = reason.unwrap_or_else(|| "Pairing was rejected".to_string());
+                                        if retryable {
+                                            pending_pin_secret = None;
+                                            info.state = OutboundPairState::PinRequired;
+                                            info.message = Some(err_msg.clone());
+                                            let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                            if let Some(reply) = pending_reply.take() {
+                                                let _ = reply.send(Err(err_msg));
+                                            }
+                                        } else {
+                                            info.state = OutboundPairState::Failed;
+                                            info.message = Some(err_msg.clone());
+                                            let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                            if let Some(reply) = pending_reply.take() {
+                                                let _ = reply.send(Err(err_msg));
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                                let msg = "Remote device closed pairing connection".to_string();
+                                info.state = OutboundPairState::Failed;
+                                info.message = Some(msg.clone());
+                                let _ = evt_tx.send(TransportEvent::OutboundPairUpdated(info.clone()));
+                                if let Some(reply) = pending_reply.take() {
+                                    let _ = reply.send(Err(msg));
+                                }
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                        }
+                    }
+                }
+            }
+
+            sessions.lock().await.remove(&session_id);
+        });
+
+        Ok(ret_info)
     }
 
     pub async fn submit_pair_pin(
@@ -1016,67 +1243,36 @@ impl TransportManager {
         session_id: Uuid,
         pin: &str,
     ) -> Result<TrustedPeer, String> {
-        let mut session = self
-            .outbound_pairs
-            .lock()
-            .await
-            .remove(&session_id)
-            .ok_or_else(|| "Pairing session expired or not found".to_string())?;
-
-        let pair_key = derive_pairing_key(pin, &session.nonce_a, &session.nonce_b)
-            .map_err(|e| e.to_string())?;
-        let shared_secret = generate_secret_hex();
-        let encrypted_secret = encrypt_bytes(
-            &pair_key,
-            b"clipnet-pair-confirm-v1",
-            shared_secret.as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-
-        let confirm = WireFrame::PairConfirm { encrypted_secret };
-        let txt = serde_json::to_string(&confirm).map_err(|e| e.to_string())?;
-        session
-            .ws
-            .send(Message::Text(txt.into()))
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let reply_msg = tokio::time::timeout(Duration::from_secs(60), session.ws.next())
-            .await
-            .map_err(|_| "Timed out waiting for approval on remote device".to_string())?
-            .ok_or_else(|| "Remote device closed pairing connection".to_string())?
-            .map_err(|e| e.to_string())?;
-
-        let reply_txt = match reply_msg {
-            Message::Text(t) => t,
-            _ => return Err("Invalid pairing result frame".to_string()),
+        let cmd_tx = {
+            let sessions = self.outbound_pairs.lock().await;
+            sessions
+                .get(&session_id)
+                .map(|s| s.cmd_tx.clone())
+                .ok_or_else(|| "Pairing session expired or not found".to_string())?
         };
-        let frame: WireFrame = serde_json::from_str(&reply_txt).map_err(|e| e.to_string())?;
-        match frame {
-            WireFrame::PairResult { accepted: true, .. } => Ok(TrustedPeer {
-                device_id: session.target_info.device_id,
-                device_name: session.target_info.device_name,
-                os: session.target_info.os,
-                fingerprint: session.target_info.fingerprint,
-                shared_secret,
-                last_addr: Some(session.remote_addr),
-                muted: false,
-                direction_override: None,
-                paired_at_ms: Utc::now().timestamp_millis(),
-            }),
-            WireFrame::PairResult {
-                accepted: false,
-                reason,
-                ..
-            } => Err(reason.unwrap_or_else(|| "Pairing was rejected".to_string())),
-            _ => Err("Unexpected response during pairing".to_string()),
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(OutboundPairCmd::SubmitPin {
+                pin: pin.trim().to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "Pairing session closed".to_string())?;
+        rx.await
+            .map_err(|_| "Pairing session closed before responding".to_string())?
+    }
+
+    pub async fn cancel_pairing(&self, session_id: Uuid) -> Result<(), String> {
+        let session = self.outbound_pairs.lock().await.remove(&session_id);
+        if let Some(s) = session {
+            let _ = s.cmd_tx.send(OutboundPairCmd::Cancel);
         }
+        Ok(())
     }
 
     pub async fn respond_incoming_pair(
         &self,
         request_id: Uuid,
-        accept: bool,
+        action: PairResponseAction,
     ) -> Result<(), String> {
         let srv = self.p2p_server.lock().await;
         let Some(handle) = srv.as_ref() else {
@@ -1086,7 +1282,13 @@ impl TransportManager {
         let entry = pending
             .get_mut(&request_id)
             .ok_or_else(|| "Pairing request not found or expired".to_string())?;
-        entry.decision = Some(accept);
+        entry.action = Some(action);
+        if action == PairResponseAction::RequirePin {
+            let now_ms = Utc::now().timestamp_millis();
+            entry.ui.status = IncomingPairStatus::PinIssued;
+            entry.ui.expires_at_ms = now_ms + (PAIR_TIMEOUT_SECS as i64 * 1000);
+            entry.deadline = tokio::time::Instant::now() + Duration::from_secs(PAIR_TIMEOUT_SECS);
+        }
         entry.notify.notify_waiters();
         emit_pending_pairs(&pending, &handle.state.evt_tx);
         Ok(())

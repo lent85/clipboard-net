@@ -4,12 +4,13 @@ use std::sync::{Arc, Mutex};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub struct TrayController {
     last_status: Mutex<Option<OverallStatus>>,
     last_direction: Mutex<Option<SyncDirection>>,
     last_peers: Mutex<Option<usize>>,
+    last_pending_pairs: Mutex<Option<usize>>,
 }
 
 impl TrayController {
@@ -18,6 +19,7 @@ impl TrayController {
             last_status: Mutex::new(None),
             last_direction: Mutex::new(None),
             last_peers: Mutex::new(None),
+            last_pending_pairs: Mutex::new(None),
         }
     }
 
@@ -44,9 +46,13 @@ impl TrayController {
         let dir_or_peers_changed = {
             let mut d = self.last_direction.lock().unwrap();
             let mut p = self.last_peers.lock().unwrap();
-            let changed = *d != Some(snap.sync_direction) || *p != Some(snap.connected_peers_count);
+            let mut pp = self.last_pending_pairs.lock().unwrap();
+            let changed = *d != Some(snap.sync_direction)
+                || *p != Some(snap.connected_peers_count)
+                || *pp != Some(snap.pending_pairs_count);
             *d = Some(snap.sync_direction);
             *p = Some(snap.connected_peers_count);
+            *pp = Some(snap.pending_pairs_count);
             changed
         };
 
@@ -90,6 +96,10 @@ pub fn init_tray(app: &AppHandle, engine: Arc<SyncEngine>) -> tauri::Result<()> 
             let eng = eng_menu.clone();
             match event.id().as_ref() {
                 "open_ui" => show_main_window(app),
+                "open_pairs" => {
+                    show_main_window(app);
+                    let _ = app.emit("clipnet://open-pair-requests", ());
+                }
                 "toggle_pause" => {
                     tauri::async_runtime::spawn(async move {
                         let cfg = eng.get_config().await;
@@ -178,6 +188,20 @@ fn build_tray_menu(app: &AppHandle, snap: &TelemetrySnapshot) -> tauri::Result<M
         None::<&str>,
     )?;
     let sep1 = PredefinedMenuItem::separator(app)?;
+    let pending_item = if snap.pending_pairs_count > 0 {
+        Some(MenuItem::with_id(
+            app,
+            "open_pairs",
+            format!(
+                "Pending Pair Requests ({}) — Open",
+                snap.pending_pairs_count
+            ),
+            true,
+            None::<&str>,
+        )?)
+    } else {
+        None
+    };
     let open_item = MenuItem::with_id(app, "open_ui", "Open ClipboardNet", true, None::<&str>)?;
     let pause_label = if snap.sync_direction == SyncDirection::Paused {
         "Resume Sync"
@@ -215,22 +239,22 @@ fn build_tray_menu(app: &AppHandle, snap: &TelemetrySnapshot) -> tauri::Result<M
     let sep3 = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, "quit_app", "Quit ClipboardNet", true, None::<&str>)?;
 
-    Menu::with_items(
-        app,
-        &[
-            &status_item,
-            &clip_item,
-            &sep1,
-            &open_item,
-            &pause_item,
-            &sep2,
-            &dir_both,
-            &dir_send,
-            &dir_recv,
-            &sep3,
-            &quit_item,
-        ],
-    )
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+        vec![&status_item, &clip_item, &sep1];
+    if let Some(ref pi) = pending_item {
+        items.push(pi);
+    }
+    items.extend_from_slice(&[
+        &open_item,
+        &pause_item,
+        &sep2,
+        &dir_both,
+        &dir_send,
+        &dir_recv,
+        &sep3,
+        &quit_item,
+    ]);
+    Menu::with_items(app, &items)
 }
 
 pub fn render_status_tray_icon(status: OverallStatus) -> Image<'static> {

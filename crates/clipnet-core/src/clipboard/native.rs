@@ -9,6 +9,8 @@ use clipboard_rs::{
     ClipboardWatcherContext, ContentFormat, RustImageData,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -34,10 +36,14 @@ struct NativeClipboardHandler {
     ctx: ClipboardContext,
     evt_tx: mpsc::UnboundedSender<ClipboardEvent>,
     health: ClipboardHealth,
+    skip_password_managers: Arc<AtomicBool>,
 }
 
 impl NativeClipboardHandler {
-    fn new(evt_tx: mpsc::UnboundedSender<ClipboardEvent>) -> Result<Self, String> {
+    fn new(
+        evt_tx: mpsc::UnboundedSender<ClipboardEvent>,
+        skip_password_managers: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
         let ctx = ClipboardContext::new().map_err(|e| format!("{e}"))?;
         let (backend_name, detail) = native_backend_label();
         let health = ClipboardHealth {
@@ -53,23 +59,28 @@ impl NativeClipboardHandler {
             ctx,
             evt_tx,
             health,
+            skip_password_managers,
         })
     }
 }
 
 impl ClipboardHandler for NativeClipboardHandler {
     fn on_clipboard_change(&mut self) {
-        if let Ok(formats) = self.ctx.available_formats() {
-            if let Some(reason) = is_sensitive_mime_target(&formats) {
-                debug!("Skipping sensitive clipboard item: {reason}");
-                self.health.skipped_privacy_count += 1;
-                let _ = self
-                    .evt_tx
-                    .send(ClipboardEvent::HealthChanged(self.health.clone()));
-                let _ = self.evt_tx.send(ClipboardEvent::SkippedPrivacy {
-                    reason: format!("Sensitive format flag: {reason}"),
-                });
-                return;
+        let has_files_or_image =
+            self.ctx.has(ContentFormat::Files) || self.ctx.has(ContentFormat::Image);
+        if self.skip_password_managers.load(Ordering::Relaxed) && !has_files_or_image {
+            if let Ok(formats) = self.ctx.available_formats() {
+                if let Some(reason) = is_sensitive_mime_target(&formats) {
+                    debug!("Skipping sensitive clipboard item: {reason}");
+                    self.health.skipped_privacy_count += 1;
+                    let _ = self
+                        .evt_tx
+                        .send(ClipboardEvent::HealthChanged(self.health.clone()));
+                    let _ = self.evt_tx.send(ClipboardEvent::SkippedPrivacy {
+                        reason: format!("Sensitive format flag: {reason}"),
+                    });
+                    return;
+                }
             }
         }
 
@@ -132,6 +143,7 @@ impl ClipboardHandler for NativeClipboardHandler {
 pub fn spawn_native_clipboard(
     mut cmd_rx: mpsc::UnboundedReceiver<ClipboardCommand>,
     evt_tx: mpsc::UnboundedSender<ClipboardEvent>,
+    skip_password_managers: Arc<AtomicBool>,
 ) {
     let evt_tx_watch = evt_tx.clone();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
@@ -140,20 +152,21 @@ pub fn spawn_native_clipboard(
         .name("clipnet-native-watcher".to_string())
         .spawn(move || {
             let (backend_name, _) = native_backend_label();
-            let handler = match NativeClipboardHandler::new(evt_tx_watch.clone()) {
-                Ok(h) => h,
-                Err(e) => {
-                    let _ = evt_tx_watch.send(ClipboardEvent::HealthChanged(ClipboardHealth {
-                        status: HealthLevel::Error,
-                        backend_name: backend_name.to_string(),
-                        session_type: detect_session_type(),
-                        detail: format!("Failed to initialize clipboard context: {e}"),
-                        last_capture_ms: None,
-                        skipped_privacy_count: 0,
-                    }));
-                    return;
-                }
-            };
+            let handler =
+                match NativeClipboardHandler::new(evt_tx_watch.clone(), skip_password_managers) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = evt_tx_watch.send(ClipboardEvent::HealthChanged(ClipboardHealth {
+                            status: HealthLevel::Error,
+                            backend_name: backend_name.to_string(),
+                            session_type: detect_session_type(),
+                            detail: format!("Failed to initialize clipboard context: {e}"),
+                            last_capture_ms: None,
+                            skipped_privacy_count: 0,
+                        }));
+                        return;
+                    }
+                };
             let mut watcher: ClipboardWatcherContext<NativeClipboardHandler> =
                 match ClipboardWatcherContext::new() {
                     Ok(w) => w,

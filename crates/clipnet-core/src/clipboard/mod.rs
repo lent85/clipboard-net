@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -108,19 +110,22 @@ impl ClipboardHandle {
     }
 }
 
-pub fn start_clipboard_backend() -> (ClipboardHandle, mpsc::UnboundedReceiver<ClipboardEvent>) {
+pub fn start_clipboard_backend(
+    skip_password_managers: Arc<AtomicBool>,
+) -> (ClipboardHandle, mpsc::UnboundedReceiver<ClipboardEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel();
 
     #[cfg(target_os = "linux")]
-    linux::spawn_linux_clipboard(cmd_rx, evt_tx);
+    linux::spawn_linux_clipboard(cmd_rx, evt_tx, skip_password_managers);
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    native::spawn_native_clipboard(cmd_rx, evt_tx);
+    native::spawn_native_clipboard(cmd_rx, evt_tx, skip_password_managers);
 
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         let _ = cmd_rx;
+        let _ = skip_password_managers;
         let _ = evt_tx.send(ClipboardEvent::HealthChanged(ClipboardHealth {
             status: HealthLevel::Error,
             backend_name: "Unsupported OS".to_string(),
@@ -324,7 +329,6 @@ pub fn is_sensitive_mime_target(targets: &[String]) -> Option<String> {
         "application/x-keepassxc-secret",
         "org.freedesktop.secret",
         "excludeclipboardcontentfrommonitorprocessing",
-        "canincludeinclipboardhistory",
         "org.nspasteboard.concealedtype",
         "org.nspasteboard.transienttype",
         "com.agilebits.onepassword",
@@ -397,6 +401,13 @@ mod tests {
             "org.nspasteboard.ConcealedType".to_string(),
         ];
         assert!(is_sensitive_mime_target(&mac_hint).is_some());
+
+        let snipping_tool = vec![
+            "CF_DIB".to_string(),
+            "PNG".to_string(),
+            "CanIncludeInClipboardHistory".to_string(),
+        ];
+        assert!(is_sensitive_mime_target(&snipping_tool).is_none());
     }
 
     #[test]

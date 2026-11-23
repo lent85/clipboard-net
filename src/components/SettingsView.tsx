@@ -314,7 +314,7 @@ export function SettingsView({
             className="h-4 w-4 accent-cyan-500"
           />
           <span>
-            Skip sensitive clipboard secrets (KeePassXC / KDE Password Manager / Windows ExcludeClipboardContent)
+            Skip sensitive password-manager text secrets (KeePassXC / KDE / macOS Concealed / Windows ExcludeClipboardContent; images & files are never blocked)
           </span>
         </label>
 

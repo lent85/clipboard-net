@@ -7,6 +7,8 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -188,6 +190,7 @@ struct OutgoingIncr {
 pub fn spawn_linux_clipboard(
     mut cmd_rx: mpsc::UnboundedReceiver<ClipboardCommand>,
     evt_tx: mpsc::UnboundedSender<ClipboardEvent>,
+    skip_password_managers: Arc<AtomicBool>,
 ) {
     let session = detect_session_type();
     if std::env::var("DISPLAY")
@@ -226,13 +229,21 @@ pub fn spawn_linux_clipboard(
         });
 
         let evt_tx_clone = evt_tx.clone();
+        let skip_clone = skip_password_managers.clone();
         std::thread::Builder::new()
             .name("clipnet-x11-clipboard".to_string())
             .spawn(move || {
-                run_x11_loop(std_cmd_rx, evt_tx_clone, wake_window_slot, session);
+                run_x11_loop(
+                    std_cmd_rx,
+                    evt_tx_clone,
+                    wake_window_slot,
+                    session,
+                    skip_clone,
+                );
             })
             .ok();
     } else if has_wl_clipboard() {
+        let _ = skip_password_managers;
         tokio::spawn(async move {
             run_wl_clipboard_fallback(cmd_rx, evt_tx, session).await;
         });
@@ -263,6 +274,7 @@ fn run_x11_loop(
     evt_tx: mpsc::UnboundedSender<ClipboardEvent>,
     wake_slot: std::sync::Arc<std::sync::Mutex<Option<(Window, Atom)>>>,
     session: String,
+    skip_password_managers: Arc<AtomicBool>,
 ) {
     let backend_name = if std::env::var("WAYLAND_DISPLAY")
         .ok()
@@ -423,7 +435,13 @@ fn run_x11_loop(
                 }
                 last_event_capture = Instant::now();
 
-                match read_x11_clipboard(&conn, our_win, &atoms, &mut atom_name_cache) {
+                match read_x11_clipboard(
+                    &conn,
+                    our_win,
+                    &atoms,
+                    &mut atom_name_cache,
+                    skip_password_managers.load(Ordering::Relaxed),
+                ) {
                     ReadOutcome::Payload(payload) => {
                         let byte_len = payload.byte_len();
                         let content_hash = payload.content_hash();
@@ -485,6 +503,7 @@ fn read_x11_clipboard(
     win: Window,
     atoms: &Atoms,
     atom_cache: &mut HashMap<Atom, String>,
+    skip_password_managers: bool,
 ) -> ReadOutcome {
     let Some(targets_bytes) = request_selection_target(conn, win, atoms, atoms.targets) else {
         return ReadOutcome::Empty;
@@ -497,18 +516,26 @@ fn read_x11_clipboard(
         .map(|&c| u32::from_ne_bytes(c))
         .collect();
 
-    let mut target_names = Vec::with_capacity(target_atoms.len());
-    for &a in &target_atoms {
-        if let Some(n) = get_atom_name(conn, a, atom_cache) {
-            target_names.push(n);
-        }
-    }
+    let has_files_or_image = target_atoms.contains(&atoms.gnome_copied_files)
+        || target_atoms.contains(&atoms.uri_list)
+        || target_atoms.contains(&atoms.image_png)
+        || target_atoms.contains(&atoms.image_bmp)
+        || target_atoms.contains(&atoms.image_jpeg);
 
-    if let Some(reason_target) = is_sensitive_mime_target(&target_names) {
-        debug!("Skipping sensitive clipboard target: {reason_target}");
-        return ReadOutcome::SkippedPrivacy(format!(
-            "Sensitive MIME target detected: {reason_target}"
-        ));
+    if skip_password_managers && !has_files_or_image {
+        let mut target_names = Vec::with_capacity(target_atoms.len());
+        for &a in &target_atoms {
+            if let Some(n) = get_atom_name(conn, a, atom_cache) {
+                target_names.push(n);
+            }
+        }
+
+        if let Some(reason_target) = is_sensitive_mime_target(&target_names) {
+            debug!("Skipping sensitive clipboard target: {reason_target}");
+            return ReadOutcome::SkippedPrivacy(format!(
+                "Sensitive MIME target detected: {reason_target}"
+            ));
+        }
     }
 
     // 1. Files

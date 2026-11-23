@@ -8,6 +8,7 @@ import type {
   HistoryEntry,
   IncomingPairUi,
   LocalInterfaceInfo,
+  OutboundPairInfo,
   SyncDirection,
   TelemetrySnapshot,
   ToastNotification,
@@ -32,16 +33,33 @@ export function App() {
   const [localIps, setLocalIps] = useState<LocalInterfaceInfo[]>([]);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [qrOpen, setQrOpen] = useState(false);
+  const [pairsMenuOpen, setPairsMenuOpen] = useState(false);
+  const [outboundPair, setOutboundPair] = useState<OutboundPairInfo | null>(null);
   const [shareUri, setShareUri] = useState("");
   const [draggingFiles, setDraggingFiles] = useState(false);
 
   const pushToast = useCallback(
-    (level: string, title: string, message: string) => {
+    (
+      level: string,
+      title: string,
+      message: string,
+      options?: { actionLabel?: string; onAction?: () => void; durationMs?: number }
+    ) => {
       const id = crypto.randomUUID();
-      setToasts((prev) => [...prev.slice(-3), { id, level, title, message }]);
+      setToasts((prev) => [
+        ...prev.slice(-3),
+        {
+          id,
+          level,
+          title,
+          message,
+          actionLabel: options?.actionLabel,
+          onAction: options?.onAction,
+        },
+      ]);
       setTimeout(() => {
         setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, 4500);
+      }, options?.durationMs ?? 4500);
     },
     []
   );
@@ -88,8 +106,36 @@ export function App() {
         message: string;
       }>("clipnet://toast", (e) => {
         if (!cancelled) {
-          pushToast(e.payload.level, e.payload.title, e.payload.message);
+          if (e.payload.title === "Pairing Request") {
+            pushToast(e.payload.level, e.payload.title, e.payload.message, {
+              actionLabel: "Review Request",
+              onAction: () => setPairsMenuOpen(true),
+              durationMs: 8000,
+            });
+          } else {
+            pushToast(e.payload.level, e.payload.title, e.payload.message);
+          }
         }
+      });
+      const u7 = await listen<OutboundPairInfo>("clipnet://outbound-pair", (e) => {
+        if (cancelled) return;
+        const info = e.payload;
+        if (info.state === "completed") {
+          setOutboundPair(null);
+          refreshAll().catch(() => {});
+          pushToast(
+            "success",
+            "Device Paired",
+            `${info.target_name} added to trusted peers`
+          );
+        } else if (info.state === "cancelled") {
+          setOutboundPair(null);
+        } else {
+          setOutboundPair(info);
+        }
+      });
+      const u8 = await listen("clipnet://open-pair-requests", () => {
+        if (!cancelled) setPairsMenuOpen(true);
       });
       const u6 = await getCurrentWebview().onDragDropEvent(async (event) => {
         if (cancelled) return;
@@ -114,7 +160,7 @@ export function App() {
           }
         }
       });
-      unlistenFns.push(u1, u2, u3, u4, u5, u6);
+      unlistenFns.push(u1, u2, u3, u4, u5, u6, u7, u8);
     };
 
     attach();
@@ -180,6 +226,18 @@ export function App() {
     <div className="relative flex h-screen flex-col overflow-hidden bg-slate-100 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
       <TopTelemetryBar
         snapshot={snapshot}
+        incomingPairs={incomingPairs}
+        pairsMenuOpen={pairsMenuOpen}
+        onTogglePairsMenu={setPairsMenuOpen}
+        onRespondIncomingPair={async (id, action) => {
+          await api.respondIncomingPair(id, action);
+          const updated = await api.getIncomingPairs();
+          setIncomingPairs(updated);
+          if (action !== "require_pin" && updated.length === 0) {
+            setPairsMenuOpen(false);
+          }
+        }}
+        onGoToDevices={() => setTab("devices")}
         onChangeDirection={handleChangeDirection}
         onOpenSettingsDiagnostics={() => setTab("settings")}
       />
@@ -191,6 +249,7 @@ export function App() {
           snapshot={snapshot}
           onSendFilesClick={handleSendFiles}
           onShowQrClick={handleShowQr}
+          onOpenPairRequests={() => setPairsMenuOpen(true)}
         />
 
         <main className="min-w-0 flex-1 overflow-y-auto p-5">
@@ -224,16 +283,26 @@ export function App() {
               <DevicesView
                 snapshot={snapshot}
                 incomingPairs={incomingPairs}
-                onRespondIncomingPair={async (id, accept) => {
-                  await api.respondIncomingPair(id, accept);
+                outboundPair={outboundPair}
+                onRespondIncomingPair={async (id, action) => {
+                  await api.respondIncomingPair(id, action);
                   setIncomingPairs(await api.getIncomingPairs());
                 }}
-                onStartPair={(addr) => api.startPairing(addr)}
+                onStartPair={async (addr) => {
+                  const info = await api.startPairing(addr);
+                  setOutboundPair(info);
+                  return info;
+                }}
                 onSubmitPin={async (sid, pin) => {
                   await api.submitPairPin(sid, pin);
+                  setOutboundPair(null);
                   await refreshAll();
-                  pushToast("success", "Paired", "Device added to trusted peers");
                 }}
+                onCancelPair={async (sid) => {
+                  await api.cancelPairing(sid);
+                  setOutboundPair(null);
+                }}
+                onDismissOutboundPair={() => setOutboundPair(null)}
                 onUpdatePeerSettings={async (id, muted, dir) => {
                   setSnapshot(await api.updatePeerSettings(id, muted, dir));
                   setConfig(await api.getConfig());
