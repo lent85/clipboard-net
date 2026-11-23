@@ -43,6 +43,6 @@ walkdir = "2"
 clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
 async-trait = "0.1"
-x11rb = { version = "0.13", features = ["xfixes"] }
+x11rb = { version = "0.14", features = ["xfixes"] }
 clipboard-rs = "0.3"
 rustls-pki-types = "1"
