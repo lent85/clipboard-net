@@ -98,7 +98,6 @@ pub async fn start_ssh_tunnel(spec: &SshTunnelSpec) -> Result<SshTunnelHandle, S
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }

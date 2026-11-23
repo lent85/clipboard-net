@@ -74,53 +74,41 @@ impl ClipboardHandler for NativeClipboardHandler {
         }
 
         let payload = if self.ctx.has(ContentFormat::Files) {
-            if let Ok(files) = self.ctx.get_files() {
-                let paths: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
-                if !paths.is_empty() {
-                    Some(ClipboardPayload::Files(paths))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            self.ctx
+                .get_files()
+                .ok()
+                .map(|files| files.into_iter().map(PathBuf::from).collect::<Vec<_>>())
+                .filter(|paths| !paths.is_empty())
+                .map(ClipboardPayload::Files)
         } else if self.ctx.has(ContentFormat::Image) {
-            if let Ok(img) = self.ctx.get_image() {
-                if let Ok(png) = img.to_png() {
+            self.ctx
+                .get_image()
+                .ok()
+                .and_then(|img| img.to_png().ok())
+                .map(|png| {
                     let png_bytes = png.get_bytes().to_vec();
                     let (w, h) = read_png_dimensions(&png_bytes).unwrap_or((0, 0));
-                    Some(ClipboardPayload::Image {
+                    ClipboardPayload::Image {
                         png_bytes,
                         width: w,
                         height: h,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+                    }
+                })
         } else if self.ctx.has(ContentFormat::Html) {
-            if let Ok(html) = self.ctx.get_html() {
-                let plain_text = self.ctx.get_text().unwrap_or_default();
-                if !html.trim().is_empty() {
-                    Some(ClipboardPayload::Html { html, plain_text })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            self.ctx
+                .get_html()
+                .ok()
+                .filter(|html| !html.trim().is_empty())
+                .map(|html| {
+                    let plain_text = self.ctx.get_text().unwrap_or_default();
+                    ClipboardPayload::Html { html, plain_text }
+                })
         } else if self.ctx.has(ContentFormat::Text) {
-            if let Ok(text) = self.ctx.get_text() {
-                if !text.is_empty() {
-                    Some(ClipboardPayload::Text(text))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            self.ctx
+                .get_text()
+                .ok()
+                .filter(|text| !text.is_empty())
+                .map(ClipboardPayload::Text)
         } else {
             None
         };
@@ -196,8 +184,8 @@ pub fn spawn_native_clipboard(
                             shutdown_handle =
                                 shutdown_rx.recv_timeout(Duration::from_millis(500)).ok();
                         }
-                        if let Some(s) = shutdown_handle {
-                            s.signal();
+                        if let Some(s) = shutdown_handle.take() {
+                            s.stop();
                         }
                         break;
                     }
@@ -231,4 +219,3 @@ pub fn spawn_native_clipboard(
         })
         .ok();
 }
-
