@@ -53,12 +53,12 @@ sudo apt update && sudo apt install -y \
   libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 ```
 
-Chạy test & build:
+Chạy test & build (tự động gắn version `MAJOR.MINOR.<commit_count>` để nâng cấp đè bản cũ):
 ```bash
 npm install
 npm run build
 cargo test --workspace
-npm run tauri build -- --bundles deb
+npm run tauri:build -- --bundles deb
 ```
 
 File cài đặt sinh ra tại `target/release/bundle/deb/*.deb`.
@@ -71,7 +71,7 @@ Yêu cầu Node.js >= 20, Rust toolchain (`rustup`), và Visual Studio Build Too
 npm install
 npm run build
 cargo test --workspace
-npm run tauri build -- --bundles msi,nsis
+npm run tauri:build -- --bundles msi,nsis
 ```
 
 ### macOS (11+ — Apple Silicon ARM64 & Intel x86_64)
@@ -82,7 +82,7 @@ Yêu cầu Node.js >= 20, Rust toolchain (`rustup`), và Xcode Command Line Tool
 npm install
 npm run build
 cargo test --workspace
-npm run tauri build -- --bundles dmg
+npm run tauri:build -- --bundles dmg
 ```
 
 ---

@@ -50,13 +50,24 @@ Chạy tự động khi **`push` lên `main`/`master`** (xuất GitHub Actions a
 
 > **Lưu ý về Runner ARM64 trên GitHub:** `windows-11-arm` và `ubuntu-24.04-arm` miễn phí cho repository **public**; với repository **private**, các job này sử dụng hạn mức phút miễn phí hoặc cấu hình runner tương ứng của gói tài khoản GitHub.
 
-### 2.3 Security & Dependency Hygiene
+### 2.3 Versioning Tự động theo Commit (`scripts/resolve-build-version.mjs`)
+Để mỗi commit mới tạo ra bộ cài **luôn nâng cấp đè được** bản cũ trên hệ điều hành mà không làm bẩn `Cargo.lock` hay các manifest gốc:
+- **Build nhánh `main`/`master`, `workflow_dispatch`, hoặc build local (`npm run tauri:build`):**
+  - Pipeline (với `fetch-depth: 0` để lấy đủ lịch sử git) và script local tự tính phiên bản theo công thức **`MAJOR.MINOR.<git_commit_count>`** (ví dụ `0.1.6`, `0.1.7`, ...), sau đó truyền vào Tauri qua cờ `--config` tạm thời.
+  - **Vì sao dùng số nguyên 3 phần (`0.1.<commit_count>`) thay vì `0.1.0-dev.<commit_count>` hoặc `+sha`?** Windows Installer / WiX (`.msi`) bỏ qua hậu tố pre-release/build metadata trong cơ chế `MajorUpgrade` (gây lỗi *"Another version is already installed"*), còn Debian `dpkg` coi `0.1.0-dev.6 < 0.1.0`. Dạng `MAJOR.MINOR.<commit_count>` tăng đơn điệu và tương thích nâng cấp tại chỗ trên cả **`.deb`**, **`.msi`**, **`.exe` (NSIS)**, **`.AppImage`** và **`.dmg`**.
+- **Phát hành chính thức theo Tag (`refs/tags/vX.Y.Z`):**
+  - Sử dụng chính xác phiên bản `X.Y.Z` của tag (và kiểm tra khớp với `Cargo.toml`, `package.json`, `src-tauri/tauri.conf.json`).
+  - Khi cắt release sau các bản build nhánh, hãy tăng `MINOR` (ví dụ `v0.2.0`) hoặc đặt `PATCH > <commit_count>` hiện tại để tag phát hành chính thức luôn có số phiên bản cao hơn các bản CI build trước đó.
+
+### 2.4 Security & Dependency Hygiene
 - **`.github/workflows/security.yml`:** Chạy lúc 03:00 UTC thứ Hai hàng tuần và mỗi khi thay đổi `Cargo.toml`, `Cargo.lock`, `package.json`, hoặc `package-lock.json` để kiểm tra `npm audit --audit-level=high` và `cargo audit`.
 - **`.github/dependabot.yml`:** Tạo PR cập nhật hàng tuần cho `cargo`, `npm`, `github-actions` và `docker` (nhóm bản vá minor/patch để giảm nhiễu PR).
 
 ---
 
 ## 3. Quy trình Phát hành Phiên bản Mới (`vX.Y.Z`)
+
+> **Lưu ý:** Chọn `X.Y.Z` cao hơn mọi build nhánh `MAJOR.MINOR.<commit_count>` trước đó (khuyên dùng tăng `MINOR`, ví dụ từ `0.1.x` lên `0.2.0`, hoặc chọn `PATCH > commit count` hiện tại) để OS installer nâng cấp sạch sẽ.
 
 1. Đồng bộ số phiên bản mới tại **cả 3 tệp**:
    - `Cargo.toml` (`[workspace.package].version`)

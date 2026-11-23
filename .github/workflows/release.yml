@@ -107,6 +107,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Linux Tauri dependencies
         if: runner.os == 'Linux'
@@ -136,6 +138,12 @@ jobs:
           npm ci
           npm run build
 
+      - name: Resolve build version
+        shell: bash
+        run: |
+          node scripts/resolve-build-version.mjs --write-config .tauri-version.override.json --github-env
+          cat .tauri-version.override.json
+
       - name: Run Rust workspace tests
         if: matrix.run_tests
         run: cargo test --workspace --locked --target ${{ matrix.target }}
@@ -146,8 +154,9 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           CI: "true"
         run: |
+          echo "Building ClipboardNet v${{ env.CLIPNET_BUILD_VERSION }} (${{ env.CLIPNET_VERSION_SOURCE }}, commit ${{ env.CLIPNET_GIT_SHA }})"
           cargo build --release --locked --target ${{ matrix.target }} -p clipnet-hub
-          npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config .tauri-version.override.json
 
       - name: Stage release assets
         shell: bash
@@ -181,6 +190,14 @@ jobs:
             cp "${files[@]}" release-assets/
           done
           ls -lh release-assets/
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### ${{ matrix.name }} (\`v${CLIPNET_BUILD_VERSION:-unknown}\`)"
+              echo "- Version source: \`${CLIPNET_VERSION_SOURCE:-unknown}\` (\`${CLIPNET_GIT_SHA:-unknown}\`)"
+              echo ""
+              ls -lh release-assets/
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4

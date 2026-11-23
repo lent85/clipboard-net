@@ -59,7 +59,9 @@ docker build -t clipnet-hub:local .
 
 ## Release Process
 
-Releases are automated via `.github/workflows/release.yml` when pushing a version tag `vX.Y.Z`:
+Branch builds in CI and local `npm run tauri:build` automatically stamp packages as `MAJOR.MINOR.<commit_count>` so OS installers upgrade cleanly on every commit.
+
+Releases are automated via `.github/workflows/release.yml` when pushing a version tag `vX.Y.Z` (choose a `MINOR` bump such as `v0.2.0`, or a `PATCH` greater than the current commit count, so formal releases always sort newer than branch builds):
 
 1. Update the version identically across:
    - `Cargo.toml` (`[workspace.package].version`)

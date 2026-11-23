@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   ClipboardList,
   KeyRound,
@@ -29,6 +31,20 @@ export function SidebarNav({
   onShowQrClick,
   onOpenPairRequests,
 }: Props) {
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    getVersion()
+      .then((ver) => {
+        if (active) setAppVersion(ver);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const activeProfilesCount = snapshot.profile_statuses.filter(
     (p) => p.state !== "disabled"
   ).length;
@@ -96,9 +112,16 @@ export function SidebarNav({
           <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-400 to-sky-600 text-slate-950 shadow-sm">
             <Network className="h-5 w-5" />
           </div>
-          <div>
-            <div className="text-sm font-bold tracking-tight text-slate-900 dark:text-white">
-              ClipboardNet
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="text-sm font-bold tracking-tight text-slate-900 dark:text-white">
+                ClipboardNet
+              </span>
+              {appVersion && (
+                <span className="rounded bg-slate-200/80 px-1.5 py-0.5 font-mono text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                  v{appVersion}
+                </span>
+              )}
             </div>
             <div className="text-[11px] text-slate-500 dark:text-slate-400">
               Cross-OS Sync Mesh

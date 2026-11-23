@@ -4,6 +4,7 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/WixTools/
+.tauri-version.override.json
 coverage/
 *.profraw
 
